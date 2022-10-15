@@ -1,0 +1,31 @@
+[package]
+version = "0.1.0"
+name = "app_name"
+repository = "https://github.com/seed-rs/seed-quickstart"
+authors = ["Your Name <email@address.com>"]
+description = "App Description"
+categories = ["category"]
+license = "MIT"
+readme = "./README.md"
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.13"
+
+[dependencies]
+# This commit points to Seed 0.7.0 with important fixes.
+# Replace with `seed = "0.8.0"` (or newer) once released.
+seed = { git = "https://github.com/seed-rs/seed", rev = "0a538f0" }
+serde = "1.0.114"
+localsearch = { path = "../"}
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
