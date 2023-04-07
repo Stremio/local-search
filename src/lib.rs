@@ -1,3 +1,4 @@
+use core::fmt;
 use fst::{self, Automaton, IntoStreamer, Streamer};
 use fxhash::{FxBuildHasher, FxHashMap};
 use num_traits::cast::FromPrimitive;
@@ -305,6 +306,7 @@ impl<T> LocalSearchBuilder<T> {
 
 // ------ Index ------
 
+#[derive(Debug)]
 pub struct Index {
     token_and_pair_index_map: fst::Map<Vec<u8>>,
     pairs: Vec<FxHashMap<DocId, TokenOccurenceCount>>,
@@ -328,6 +330,23 @@ pub struct LocalSearch<T> {
     pub max_prefix_boost: f64,
     pub score_threshold: f64,
     index: Index,
+}
+
+impl<T> fmt::Debug for LocalSearch<T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalSearch")
+            .field("documents", &self.documents)
+            .field("tokenizer", &"Box<dyn Fn(&str) -> Vec<Token>>")
+            .field("max_edit_distance", &self.max_edit_distance)
+            .field("max_edit_distance_boost", &self.max_edit_distance_boost)
+            .field("max_prefix_boost", &self.max_prefix_boost)
+            .field("score_threshold", &self.score_threshold)
+            .field("index", &self.index)
+            .finish()
+    }
 }
 
 impl<T> LocalSearch<T> {
@@ -367,8 +386,10 @@ impl<T> LocalSearch<T> {
         LocalSearchBuilder::new(documents, text_extractor)
     }
 
-    #[must_use]
-    /// Search documents according to the provided search query.
+    /// Search documents according to the provided search query ordered by their score descending.
+    ///
+    /// It also filters out any result which doesn't meet the [`Self::score_threshold`] given the
+    /// highest score in the search results.
     ///
     /// # Arguments
     ///
@@ -394,6 +415,7 @@ impl<T> LocalSearch<T> {
     ///         .collect()
     /// }
     /// ```
+    #[must_use]
     pub fn search(&self, query: &str, max_results: usize) -> Vec<(&T, Score)> {
         let mut doc_ids_and_scores = (self.tokenizer)(query)
             .into_iter()
@@ -445,7 +467,6 @@ impl<T> LocalSearch<T> {
             .collect()
     }
 
-    #[must_use]
     /// Search for document tokens that have the provided string as a prefix.
     ///
     /// # Arguments
@@ -470,6 +491,7 @@ impl<T> LocalSearch<T> {
     ///     }
     /// }
     /// ```
+    #[must_use]
     pub fn autocomplete(&self, query_token: &str, max_results: usize) -> Vec<String> {
         let mut token_stream = self
             .index
