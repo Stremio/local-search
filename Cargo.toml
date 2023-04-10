@@ -5,7 +5,7 @@ authors = ["Martin Kavík <martin@kavik.cz>"]
 edition = "2018"
 
 [dependencies]
-fxhash = "0.2.1"
-fst = { version = "0.4.0" }
-utf8-ranges = "1.0.4"
-num-traits = "0.2.12"
+fxhash = "0.2"
+fst = { version = "0.4" }
+utf8-ranges = "1.0"
+num-traits = "0.2"
