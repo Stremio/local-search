@@ -1,8 +1,10 @@
-use localsearch::{self, LocalSearch, Score};
+use std::str::FromStr;
+
 use seed::{fetch, prelude::*, *};
 use serde::Deserialize;
-use std::str::FromStr;
 use web_sys::Performance;
+
+use localsearch::{self, LocalSearch, Score, Tokenizer, DefaultTokenizer};
 
 // ------ ------
 //     Model
@@ -138,7 +140,7 @@ fn autocomplete(
     local_search: &LocalSearch<Record>,
     max_results: usize,
 ) -> Vec<String> {
-    localsearch::default_tokenizer(query)
+    DefaultTokenizer.tokenize(query)
         .last()
         .map_or(Vec::new(), |last_token| {
             local_search.autocomplete(last_token, max_results)
