@@ -23,7 +23,7 @@ pub const DEFAULT_MAX_EDIT_DISTANCE_BOOST: f64 = 2.;
 pub const DEFAULT_MAX_PREFIX_BOOST: f64 = 1.5;
 pub const DEFAULT_SCORE_THRESHOLD: f64 = 0.48;
 
-pub trait Tokenizer: Clone + fmt::Debug {
+pub trait Tokenizer: fmt::Debug {
     #[must_use]
     fn tokenize(&self, text: &str) -> Vec<Token>;
 }
@@ -43,7 +43,7 @@ pub trait Tokenizer: Clone + fmt::Debug {
 ///     ["spiderman", "far", "from", "home"]
 /// );
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct DefaultTokenizer;
 
 impl Tokenizer for DefaultTokenizer {
@@ -134,7 +134,7 @@ where
     /// # struct Record { name: String }
     /// # let downloaded_records = vec![Record { name: "superman".to_owned() }];
     ///
-    /// #[derive(Clone, Debug)]
+    /// #[derive(Debug)]
     /// struct CustomTokenizer;
     ///
     /// impl Tokenizer for CustomTokenizer {
@@ -382,22 +382,23 @@ where
     }
 }
 
-// impl<T> Clone for LocalSearch<T>
-// where
-//     T: Clone,
-// {
-//     fn clone(&self) -> Self {
-//         Self {
-//             documents: self.documents.clone(),
-//             tokenizer: Box::new(self.tokenizer.clone()),
-//             max_edit_distance: self.max_edit_distance.clone(),
-//             max_edit_distance_boost: self.max_edit_distance_boost.clone(),
-//             max_prefix_boost: self.max_prefix_boost.clone(),
-//             score_threshold: self.score_threshold.clone(),
-//             index: self.index.clone(),
-//         }
-//     }
-// }
+impl<T, TF> Clone for LocalSearch<T, TF>
+where
+    T: Clone,
+    TF: Tokenizer + Clone
+{
+    fn clone(&self) -> Self {
+        Self {
+            documents: self.documents.clone(),
+            tokenizer: self.tokenizer.clone(),
+            max_edit_distance: self.max_edit_distance.clone(),
+            max_edit_distance_boost: self.max_edit_distance_boost.clone(),
+            max_prefix_boost: self.max_prefix_boost.clone(),
+            score_threshold: self.score_threshold.clone(),
+            index: self.index.clone(),
+        }
+    }
+}
 
 impl<T> LocalSearch<T, DefaultTokenizer> {
     // ------ pub ------
