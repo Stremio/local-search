@@ -1,10 +1,14 @@
 use std::str::FromStr;
 
-use seed::{fetch, prelude::*, *};
+use seed::{prelude::*, *};
 use serde::Deserialize;
 use web_sys::Performance;
+use num::{rational::Ratio, ToPrimitive};
+use gloo_net::http::Request;
 
-use localsearch::{self, LocalSearch, Score, Tokenizer, DefaultTokenizer};
+use localsearch::{self, DefaultTokenizer, LocalSearch, Score, Tokenizer};
+
+use stremio_core::models::local_search::Searchable;
 
 // ------ ------
 //     Model
@@ -29,14 +33,15 @@ pub struct Model {
     index_options: IndexOptions,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Record {
-    id: String,
-    name: String,
-    #[serde(rename(deserialize = "imdbRating"))]
-    imdb_rating: f64,
-    popularity: f64,
-}
+pub type Record = stremio_core::models::local_search::Searchable;
+// #[derive(Clone, Debug, Deserialize)]
+// #[serde(rename_all = "camelCase")]
+// pub struct Record {
+//     id: String,
+//     name: String,
+//     imdb_rating: f64,
+//     popularity: f64,
+// }
 
 #[derive(Copy, Clone)]
 struct IndexOptions {
@@ -78,7 +83,7 @@ pub fn init(title: &'static str, download_url: &'static str) -> Model {
 
 pub enum Msg {
     Download,
-    Downloaded(fetch::Result<Vec<Record>>),
+    Downloaded(Result<Vec<Record>, gloo_net::Error>),
     ImdbRatingWeightChanged(String),
     PopularityWeightChanged(String),
     Index,
@@ -90,7 +95,7 @@ pub enum Msg {
 }
 
 async fn fetch_records(url: &'static str) -> Msg {
-    Msg::Downloaded(async { fetch(url).await?.json().await }.await)
+    Msg::Downloaded(async { Request::get(url).send().await?.json().await }.await)
 }
 
 fn index(
@@ -98,22 +103,58 @@ fn index(
     index_options: IndexOptions,
     score_threshold: f64,
 ) -> LocalSearch<Record> {
-    let max_imdb_rating = 10.;
+    // let max_imdb_rating = 10.;
+
+    // let max_popularity = downloaded_records
+    //     .iter()
+    //     .map(|record| record.popularity)
+    //     .max_by(|popularity_a, popularity_b| popularity_a.partial_cmp(popularity_b).unwrap())
+    //     .unwrap_or_default();
+
+    // let IndexOptions {
+    //     imdb_rating_weight,
+    //     popularity_weight,
+    // } = index_options;
+
+    // let boost_computer = move |record: &Record| {
+    //     let imdb_rating_boost = (record.imdb_rating / max_imdb_rating * imdb_rating_weight).exp();
+    //     let popularity_boost = (record.popularity / max_popularity * popularity_weight).exp();
+    //     imdb_rating_boost * popularity_boost
+    // };
+
+    let max_imdb_rating = downloaded_records
+        .iter()
+        // it's ok to set rating to 0 for the max if no items are present
+        .map(|searchable| searchable.imdb_rating.unwrap_or_default())
+        .max_by(|rating_a, rating_b| rating_a.partial_cmp(rating_b).unwrap())
+        .unwrap_or_default();
 
     let max_popularity = downloaded_records
         .iter()
-        .map(|record| record.popularity)
+        .map(|searchable| searchable.popularity.unwrap_or_default())
+        // it's ok to set popularity to 0 for the max if no items are present
         .max_by(|popularity_a, popularity_b| popularity_a.partial_cmp(popularity_b).unwrap())
         .unwrap_or_default();
 
-    let IndexOptions {
-        imdb_rating_weight,
-        popularity_weight,
-    } = index_options;
+    let boost_computer = move |searchable: &Searchable| {
+        let imdb_rating_boost = searchable
+            .imdb_rating
+            .map(|imdb_rating| {
+                (imdb_rating.to_f64() / max_imdb_rating.to_f64() * index_options.imdb_rating_weight)
+                    .exp()
+            })
+            .unwrap_or(1.0);
 
-    let boost_computer = move |record: &Record| {
-        let imdb_rating_boost = (record.imdb_rating / max_imdb_rating * imdb_rating_weight).exp();
-        let popularity_boost = (record.popularity / max_popularity * popularity_weight).exp();
+        let popularity_boost = searchable
+            .popularity
+            .and_then(|popularity| {
+                // make sure we always have > 0, because ratio will panic if denom is 0!
+                let popularity_percent = Ratio::new(popularity, max_popularity.max(1)).to_f64()?;
+
+                Some((popularity_percent * index_options.popularity_weight).exp())
+            })
+            .unwrap_or(1.0);
+
         imdb_rating_boost * popularity_boost
     };
 
@@ -140,7 +181,8 @@ fn autocomplete(
     local_search: &LocalSearch<Record>,
     max_results: usize,
 ) -> Vec<String> {
-    DefaultTokenizer.tokenize(query)
+    DefaultTokenizer
+        .tokenize(query)
         .last()
         .map_or(Vec::new(), |last_token| {
             local_search.autocomplete(last_token, max_results)
@@ -159,7 +201,7 @@ pub fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
             model.download_time = Some(model.performance.now() - model.download_start);
         }
         Msg::Downloaded(Err(err)) => {
-            log!("Download error", err);
+            gloo_console::log!("Download error", err.to_string());
         }
         Msg::ImdbRatingWeightChanged(imdb_rating_weight) => {
             if let Ok(imdb_rating_weight) = f64::from_str(&imdb_rating_weight) {
@@ -510,13 +552,13 @@ pub fn view_result(result_item_data: (usize, &(Record, Score))) -> Node<Msg> {
             style! {
                 St::Padding => px(10),
             },
-            &record.imdb_rating,
+            &record.imdb_rating.unwrap_or_default().to_f64(),
         ],
         td![
             style! {
                 St::Padding => px(10),
             },
-            &record.popularity,
+            &record.popularity.unwrap_or_default().to_f64(),
         ],
     ]
 }
