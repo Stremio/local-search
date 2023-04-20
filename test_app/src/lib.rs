@@ -58,7 +58,7 @@ fn view(model: &Model) -> Node<Msg> {
             St::FlexWrap => "wrap",
             St::MaxWidth => vw(100),
             St::MaxHeight => vh(100),
-            St::Overflow => "auto",
+            St::Overflow => "inherit",
         },
         localsearch_search_panel::view(&model.cinemeta_localsearch_20_000)
             .map_msg(Msg::CinemetaLocalsearch20000),
