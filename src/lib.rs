@@ -1,5 +1,5 @@
 use core::fmt;
-use fst::{self, Automaton, IntoStreamer, Streamer};
+use fst::{Automaton, IntoStreamer, Streamer};
 use fxhash::{FxBuildHasher, FxHashMap};
 use num_traits::cast::FromPrimitive;
 use std::iter::FromIterator;
@@ -9,7 +9,7 @@ pub type Distance = usize;
 pub type Score = f64;
 type DocId = usize;
 type TokenCount = usize;
-type TokenOccurenceCount = usize;
+type TokenOccurrenceCount = usize;
 type DocBoost = f64;
 
 mod levenshtein;
@@ -23,44 +23,54 @@ pub const DEFAULT_MAX_EDIT_DISTANCE_BOOST: f64 = 2.;
 pub const DEFAULT_MAX_PREFIX_BOOST: f64 = 1.5;
 pub const DEFAULT_SCORE_THRESHOLD: f64 = 0.48;
 
+pub trait Tokenizer: fmt::Debug {
+    #[must_use]
+    fn tokenize(&self, text: &str) -> Vec<Token>;
+}
+
 /// The default tokenizer.
+///
 /// - It's used for document indexing and for the search query parsing.
 /// - It replaces characters `:` and `,` with a space, removes `-` and splits the words by a whitespace and converts them to lower case.
 /// - If you want to use a custom tokenizer, call the method `LocalSearchBuilder::tokenizer`.
 ///
-/// ## Test
+/// ## Examples
 ///
 /// ```
-/// # use localsearch::default_tokenizer;
+/// # use localsearch::{Tokenizer, DefaultTokenizer};
 /// assert_eq!(
-///     default_tokenizer("Spider-Man: Far from Home"),
+///     DefaultTokenizer.tokenize("Spider-Man: Far from Home"),
 ///     ["spiderman", "far", "from", "home"]
 /// );
 /// ```
-#[must_use]
-pub fn default_tokenizer(text: &str) -> Vec<Token> {
-    text.replace([':', ','].as_ref(), " ")
-        .replace('-', "")
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect()
+#[derive(Clone, Copy, Debug)]
+pub struct DefaultTokenizer;
+
+impl Tokenizer for DefaultTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        text.replace([':', ','].as_ref(), " ")
+            .replace('-', "")
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect()
+    }
 }
 
 // ------ LocalSearchBuilder ------
 
 /// Use `LocalSearchBuilder::new(...)` + `build()` to create a new `LocalSearch` instance.
-pub struct LocalSearchBuilder<T> {
+pub struct LocalSearchBuilder<T, TF = DefaultTokenizer> {
     documents: Vec<T>,
     text_extractor: Box<dyn Fn(&T) -> &str>,
     boost_computer: Option<Box<dyn Fn(&T) -> f64>>,
-    tokenizer: Option<Box<dyn Fn(&str) -> Vec<Token>>>,
+    tokenizer: TF,
     max_edit_distance: Option<Distance>,
     max_edit_distance_boost: Option<f64>,
     max_prefix_boost: Option<f64>,
     score_threshold: Option<f64>,
 }
 
-impl<T> LocalSearchBuilder<T> {
+impl<T> LocalSearchBuilder<T, DefaultTokenizer> {
     /// Creates a new `LocalSearchBuilder` instance.
     ///
     /// _Note:_ You should use `LocalSearch::builder` instead.
@@ -69,16 +79,21 @@ impl<T> LocalSearchBuilder<T> {
             documents,
             text_extractor: Box::new(text_extractor),
             boost_computer: None,
-            tokenizer: None,
+            tokenizer: DefaultTokenizer,
             max_edit_distance: None,
             max_edit_distance_boost: None,
             max_prefix_boost: None,
             score_threshold: None,
         }
     }
+}
 
+impl<T, TF> LocalSearchBuilder<T, TF>
+where
+    TF: Tokenizer,
+{
     /// Sets the boost computer. It's a closure that can boost the score for the particular document.
-    /// The final document score is multipled by the computed value returned from the closure.
+    /// The final document score is multiplied by the computed value returned from the closure.
     ///
     /// It's called for each document during the search.
     ///
@@ -115,18 +130,38 @@ impl<T> LocalSearchBuilder<T> {
     /// # Example
     ///
     /// ```
-    /// # use localsearch::LocalSearch;
+    /// use localsearch::{LocalSearch, Tokenizer, Token};
     /// # struct Record { name: String }
     /// # let downloaded_records = vec![Record { name: "superman".to_owned() }];
     ///
+    /// #[derive(Debug)]
+    /// struct CustomTokenizer;
+    ///
+    /// impl Tokenizer for CustomTokenizer {
+    ///    fn tokenize(&self, text: &str) -> Vec<Token> {
+    ///         text.split_whitespace().map(str::to_lowercase).collect()
+    ///    }
+    /// }
+    ///
     /// LocalSearch::builder(downloaded_records, |rec| &rec.name)
-    ///     .tokenizer(|text| text.split_whitespace().map(str::to_lowercase).collect())
+    ///     .tokenizer(CustomTokenizer)
     ///     .build();
     /// ```
     #[must_use]
-    pub fn tokenizer(mut self, tokenizer: impl Fn(&str) -> Vec<Token> + 'static) -> Self {
-        self.tokenizer = Some(Box::new(tokenizer));
-        self
+    pub fn tokenizer<TF2>(self, tokenizer: TF2) -> LocalSearchBuilder<T, TF2>
+    where
+        TF2: Tokenizer,
+    {
+        LocalSearchBuilder {
+            documents: self.documents,
+            text_extractor: self.text_extractor,
+            boost_computer: self.boost_computer,
+            tokenizer,
+            max_edit_distance: self.max_edit_distance,
+            max_edit_distance_boost: self.max_edit_distance_boost,
+            max_prefix_boost: self.max_prefix_boost,
+            score_threshold: self.score_threshold,
+        }
     }
 
     /// Sets the maximum edit distance.
@@ -229,7 +264,7 @@ impl<T> LocalSearchBuilder<T> {
     ///
     /// _Note:_ Indexing may took awhile for a big dataset.
     #[must_use]
-    pub fn build(self) -> LocalSearch<T> {
+    pub fn build(self) -> LocalSearch<T, TF> {
         // Container for documents with additional data.
         // - `DocId` is a document position from the original document `Vec`.
         // - `T` is the document type.
@@ -239,14 +274,11 @@ impl<T> LocalSearchBuilder<T> {
             self.documents.len(),
             FxBuildHasher::default(),
         );
-        let tokenizer = self
-            .tokenizer
-            .unwrap_or_else(|| Box::new(default_tokenizer));
         let boost_computer = self.boost_computer.unwrap_or_else(|| Box::new(|_| 1.0));
 
         // `token_and_pairs_map` will be later a part of the index and it contains important data for the tf-idf algorithm.
         let mut token_and_pairs_map =
-            FxHashMap::<Token, FxHashMap<DocId, TokenOccurenceCount>>::with_capacity_and_hasher(
+            FxHashMap::<Token, FxHashMap<DocId, TokenOccurrenceCount>>::with_capacity_and_hasher(
                 self.documents.len(),
                 FxBuildHasher::default(),
             );
@@ -254,7 +286,7 @@ impl<T> LocalSearchBuilder<T> {
         // These loops fill `documents` and `token_and_pairs_map`.
         for (doc_id, document) in self.documents.into_iter().enumerate() {
             let text = (self.text_extractor)(&document);
-            let tokens = tokenizer(text);
+            let tokens = self.tokenizer.tokenize(text);
             let token_count = tokens.len();
             let doc_boost = boost_computer(&document);
             documents.insert(doc_id, (document, token_count, doc_boost));
@@ -292,7 +324,7 @@ impl<T> LocalSearchBuilder<T> {
 
         LocalSearch {
             documents,
-            tokenizer,
+            tokenizer: self.tokenizer,
             max_edit_distance: self.max_edit_distance.unwrap_or(DEFAULT_MAX_EDIT_DISTANCE),
             max_edit_distance_boost: self
                 .max_edit_distance_boost
@@ -306,10 +338,10 @@ impl<T> LocalSearchBuilder<T> {
 
 // ------ Index ------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index {
     token_and_pair_index_map: fst::Map<Vec<u8>>,
-    pairs: Vec<FxHashMap<DocId, TokenOccurenceCount>>,
+    pairs: Vec<FxHashMap<DocId, TokenOccurrenceCount>>,
 }
 
 // ------ RelatedTokenData ------
@@ -322,9 +354,9 @@ struct RelatedTokenData {
 
 // ------ LocalSearch ------
 
-pub struct LocalSearch<T> {
+pub struct LocalSearch<T, TF = DefaultTokenizer> {
     documents: FxHashMap<DocId, (T, TokenCount, DocBoost)>,
-    tokenizer: Box<dyn Fn(&str) -> Vec<Token>>,
+    tokenizer: TF,
     pub max_edit_distance: Distance,
     pub max_edit_distance_boost: f64,
     pub max_prefix_boost: f64,
@@ -332,9 +364,10 @@ pub struct LocalSearch<T> {
     index: Index,
 }
 
-impl<T> fmt::Debug for LocalSearch<T>
+impl<T, TF> fmt::Debug for LocalSearch<T, TF>
 where
     T: fmt::Debug,
+    TF: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalSearch")
@@ -349,7 +382,25 @@ where
     }
 }
 
-impl<T> LocalSearch<T> {
+impl<T, TF> Clone for LocalSearch<T, TF>
+where
+    T: Clone,
+    TF: Tokenizer + Clone
+{
+    fn clone(&self) -> Self {
+        Self {
+            documents: self.documents.clone(),
+            tokenizer: self.tokenizer.clone(),
+            max_edit_distance: self.max_edit_distance.clone(),
+            max_edit_distance_boost: self.max_edit_distance_boost.clone(),
+            max_prefix_boost: self.max_prefix_boost.clone(),
+            score_threshold: self.score_threshold.clone(),
+            index: self.index.clone(),
+        }
+    }
+}
+
+impl<T> LocalSearch<T, DefaultTokenizer> {
     // ------ pub ------
 
     /// Creates a new `LocalSearchBuilder` instance.
@@ -385,7 +436,12 @@ impl<T> LocalSearch<T> {
     ) -> LocalSearchBuilder<T> {
         LocalSearchBuilder::new(documents, text_extractor)
     }
+}
 
+impl<T, TF> LocalSearch<T, TF>
+where
+    TF: Tokenizer,
+{
     /// Search documents according to the provided search query ordered by their score descending.
     ///
     /// It also filters out any result which doesn't meet the [`Self::score_threshold`] given the
@@ -417,7 +473,9 @@ impl<T> LocalSearch<T> {
     /// ```
     #[must_use]
     pub fn search(&self, query: &str, max_results: usize) -> Vec<(&T, Score)> {
-        let mut doc_ids_and_scores = (self.tokenizer)(query)
+        let mut doc_ids_and_scores = self
+            .tokenizer
+            .tokenize(query)
             .into_iter()
             // Find related tokens to the tokens parsed from the query.
             // Related tokens are determined by the prefix search or distance search or by the exact match with the query tokens.
@@ -477,14 +535,15 @@ impl<T> LocalSearch<T> {
     /// * `max_results`
     ///   - The maximum number of results that can be returned.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```
     /// # use localsearch::LocalSearch;
+    /// use localsearch::Tokenizer;
     /// # struct Record { name: String }
     ///
     /// fn autocomplete(query: &str, local_search: &LocalSearch<Record>, max_results: usize) -> Vec<String> {
-    ///     if let Some(last_token) = localsearch::default_tokenizer(query).last() {
+    ///     if let Some(last_token) = localsearch::DefaultTokenizer.tokenize(query).last() {
     ///         local_search.autocomplete(last_token, max_results)
     ///     } else {
     ///         Vec::new()
@@ -628,7 +687,7 @@ impl<T> LocalSearch<T> {
     fn score_docs(&self, token: &str, token_data: RelatedTokenData) -> FxHashMap<DocId, Score> {
         self.index
             .token_and_pair_index_map
-            .get(&token)
+            .get(token)
             .map(|pair_index| {
                 let pair_index = usize::from_u64(pair_index).expect("pair_index as usize");
                 let doc_id_token_occurrence_count_pairs =
