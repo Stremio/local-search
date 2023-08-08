@@ -4,6 +4,10 @@ version = "0.1.0"
 authors = ["Martin Kavík <martin@kavik.cz>"]
 edition = "2021"
 
+# because of `#![feature(const_fn_trait_bound)]` stabilized in 1.61
+# https://github.com/rust-lang/rust/issues/93706
+rust-version = "1.61"
+
 [dependencies]
 fxhash = "0.2"
 fst = { version = "0.4" }
