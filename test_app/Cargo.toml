@@ -18,9 +18,17 @@ wasm-bindgen-test = "0.3.13"
 [dependencies]
 # This commit points to Seed 0.7.0 with important fixes.
 # Replace with `seed = "0.8.0"` (or newer) once released.
-seed = { git = "https://github.com/seed-rs/seed", rev = "0a538f0" }
+seed = { version = "0.10", features = ["routing"] }
+# console.log
+gloo-console = "0.2"
+# making requests
+gloo-net = { version = "0.2", features = ["http", "json"], default-features = false }
+
 serde = "1.0.114"
 localsearch = { path = "../"}
+num = { version = "0.4", default-features = false }
+
+stremio-core = { git = "https://github.com/Stremio/stremio-core", branch = "localsearch" }
 
 [profile.release]
 lto = true
