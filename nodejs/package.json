@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "build": "wasm-pack build --target nodejs --release --out-dir pkg ..",
-    "test": "node test.js"
+    "test": "node test.js && node manager.test.js"
   },
   "license": "MIT"
 }

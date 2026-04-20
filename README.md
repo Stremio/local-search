@@ -72,6 +72,65 @@ build ~220 ms, `search()` ~0.7 ms/query, `autocomplete()` ~20 µs/query.
 See [`nodejs/index.js`](nodejs/index.js) for the full wrapper and
 [`nodejs/test.js`](nodejs/test.js) for correctness + benchmark tests.
 
+#### IndexManager — server pattern for many lists × languages
+
+[`nodejs/manager.js`](nodejs/manager.js) provides an `IndexManager` class
+suited for Node servers that search across many lists in multiple languages:
+
+- **English index per list, always hot** — built on demand or via `prewarmEnglish`.
+- **User-language index per (list, lang), LRU-cached** by byte budget, rebuilt
+  transparently when evicted.
+- **Build coalescing** — concurrent queries for the same cold index share one
+  build; the second caller doesn't trigger a duplicate rebuild.
+- **Build concurrency limit** — caps the number of simultaneous cold builds so
+  event-loop stalls stay bounded (default 2).
+- **Automatic merge** across (list × language) results, deduplicated by item id
+  with the best-scoring language winning.
+
+```js
+const { IndexManager } = require('./nodejs/manager.js');
+
+const manager = new IndexManager({
+  loadList: async (listId) => fetchListItemsFromDB(listId),
+  titleFor: (item, lang) => item.titles[lang],            // or `item.titleEn` / `item.titleByLang[lang]`
+  boostComputer: (item) => Math.exp(item.rating / 10),    // optional
+  userLangBudgetBytes: 500 * 1024 * 1024,                 // LRU budget (default 500 MB)
+  maxConcurrentBuilds: 2,                                 // default 2
+  builderOptions: { maxEditDistance: 1, scoreThreshold: 0.48 },
+});
+
+// Warm the English indexes at server start.
+await manager.prewarmEnglish(['movies-top', 'movies-90s', 'series-top', /* ... */]);
+
+// Per-request query: 2 lists × 2 languages = 4 searches, merged by item id.
+const results = await manager.search({
+  query: 'matrix',
+  listIds: ['movies-top', 'series-top'],
+  userLang: 'fr',
+  maxResults: 15,
+});
+// => [{ doc, score, matchedLang: 'en' | 'fr' }, ...]
+```
+
+Run the IndexManager tests (includes LRU unit tests + a 20 k-docs-across-10-lists
+benchmark): `node nodejs/manager.test.js`.
+
+##### Scaling notes
+
+- **Single shared WASM linear memory.** All indexes in one Node process share
+  the wasm32 heap (4 GB hard cap). Comfortable at hundreds of MB; if you
+  approach 2 GB, shard across Node `worker_threads`, each with its own wasm
+  module and its own subset of lists (searches are dispatched to the owning
+  worker). Wasm instances can't be transferred between threads.
+- **Cold builds block the event loop** during the wasm call. A 400 ms build on
+  a 40 k-item list will stall other requests. For steady-state (warm) searches
+  this is never an issue — they're ~1 ms. For cold builds on a busy server,
+  running `IndexManager` inside dedicated `worker_thread`s (one per shard) is
+  the recommended scale-up path.
+- **Cluster / multi-process.** Every Node worker process keeps its own copy of
+  every index — memory use is `processes × indexes`. Prefer vertical scaling
+  of a single process with `worker_threads` over horizontal process forks.
+
 ### Development
 
 Run unit and doc tests by `$ cargo test` from the project root. And then `$ cargo fmt --all`.
