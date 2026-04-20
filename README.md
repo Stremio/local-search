@@ -28,6 +28,50 @@
 
 ---
 
+### Node.js
+
+The Rust crate can be built as a WebAssembly module and used from Node.js with
+the same performance as any other Rust-to-WASM target (no core logic is
+reimplemented in JS).
+
+Build and run the smoke test:
+
+```sh
+$ wasm-pack build --target nodejs --release --out-dir pkg
+$ node nodejs/test.js
+```
+
+Usage:
+
+```js
+const { LocalSearchBuilder } = require('./nodejs');
+
+const docs = [
+  { id: 'tt0109830', name: 'Forrest Gump',    imdbRating: 8.8, popularity: 40 },
+  { id: 'tt0137523', name: 'Fight Club',      imdbRating: 8.8, popularity: 35 },
+  { id: 'tt0133093', name: 'The Matrix',      imdbRating: 8.7, popularity: 55 },
+];
+
+const maxPop = Math.max(...docs.map(d => d.popularity));
+const search = new LocalSearchBuilder(docs, d => d.name)
+  .boostComputer(d => Math.exp(d.imdbRating / 10) * Math.exp(d.popularity / maxPop))
+  .maxEditDistance(1)
+  .scoreThreshold(0.48)
+  .build();
+
+for (const { doc, score } of search.search('matrix', 5)) {
+  console.log(score.toFixed(2), doc.name);
+}
+
+console.log(search.autocomplete('fo', 5)); // ['forrest']
+```
+
+Indicative timings on the 20 000-title Cinemeta dataset (Apple Silicon, Node 22):
+build ~220 ms, `search()` ~0.7 ms/query, `autocomplete()` ~20 µs/query.
+
+See [`nodejs/index.js`](nodejs/index.js) for the full wrapper and
+[`nodejs/test.js`](nodejs/test.js) for correctness + benchmark tests.
+
 ### Development
 
 Run unit and doc tests by `$ cargo test` from the project root. And then `$ cargo fmt --all`.

@@ -1,0 +1,11 @@
+{
+  "name": "localsearch-node",
+  "version": "0.1.0",
+  "description": "Node.js bindings for the localsearch Rust crate (via WebAssembly).",
+  "main": "index.js",
+  "scripts": {
+    "build": "wasm-pack build --target nodejs --release --out-dir pkg ..",
+    "test": "node test.js"
+  },
+  "license": "MIT"
+}

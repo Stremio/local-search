@@ -14,6 +14,9 @@ type DocBoost = f64;
 
 mod levenshtein;
 
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+
 use levenshtein::{Levenshtein, LevenshteinState};
 
 // ------ Defaults ------
