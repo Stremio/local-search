@@ -73,9 +73,13 @@ class ByteSizedLRU {
 
 /**
  * @typedef {Object} IndexManagerOptions
- * @property {(listId: string) => (any[] | Promise<any[]>)} loadList
- *   Async callback returning the items for a list. Called once per cold
- *   (list, lang) combination; items may be filtered internally per language.
+ * @property {(listId: string, lang: string) => (any[] | Promise<any[]>)} loadList
+ *   Async callback returning the items for one (list, language) pair. Called
+ *   once per (listId, lang) combination that becomes hot; cached with
+ *   reference counting while an index referencing it exists. Callers whose
+ *   data source has all language titles on a single object can ignore `lang`
+ *   and return the same items each time (they'll be re-read per language but
+ *   the caller can memoize in a closure).
  * @property {(item: any, lang: string) => (string | null | undefined)} titleFor
  *   Returns the indexable title for an item in the given language, or a falsy
  *   value if none exists (those items are skipped for that language's index).
@@ -90,6 +94,20 @@ class ByteSizedLRU {
  * @property {Object} [builderOptions]
  *   Options forwarded to every `LocalSearchBuilder`: `maxEditDistance`,
  *   `maxEditDistanceBoost`, `maxPrefixBoost`, `scoreThreshold`.
+ * @property {'scoreMax' | 'preferUserLang'} [preferDoc='scoreMax']
+ *   When the same item id matches in multiple languages, which `doc` object
+ *   gets returned. `'scoreMax'` (default) returns the doc from whichever
+ *   language scored highest — preserves the original behavior. `'preferUserLang'`
+ *   returns the user-language doc whenever one exists for that item (even if
+ *   the query matched only the English index), falling back to English if
+ *   the item has no user-language version. Use `'preferUserLang'` when your
+ *   per-language lists hold distinct doc objects with localized fields and
+ *   you want result UIs to render in the user's language.
+ * @property {'max' | 'sum'} [scoreCombine='max']
+ *   How to combine scores when the same item id matches in multiple languages.
+ *   `'max'` (default) keeps the best single-language score. `'sum'` adds
+ *   scores from each matching language, rewarding items that matched in
+ *   multiple languages.
  */
 
 class IndexManager {
@@ -108,17 +126,27 @@ class IndexManager {
     this.estimateBytes = opts.estimateBytes ?? ((items) => items.length * 1500);
     this.maxConcurrentBuilds = opts.maxConcurrentBuilds ?? 2;
 
+    this.preferDoc = opts.preferDoc ?? 'scoreMax';
+    if (this.preferDoc !== 'scoreMax' && this.preferDoc !== 'preferUserLang') {
+      throw new TypeError(
+        "IndexManager: preferDoc must be 'scoreMax' or 'preferUserLang'",
+      );
+    }
+    this.scoreCombine = opts.scoreCombine ?? 'max';
+    if (this.scoreCombine !== 'max' && this.scoreCombine !== 'sum') {
+      throw new TypeError("IndexManager: scoreCombine must be 'max' or 'sum'");
+    }
+
     this._english = new Map(); // listId -> entry
     this._userLang = new ByteSizedLRU({
       maxBytes: opts.userLangBudgetBytes ?? 500 * 1024 * 1024,
       onEvict: (_key, entry) => entry.instance.free(),
     });
 
-    // Shared raw items per list — avoids re-running `loadList` when building
-    // additional language indexes for the same list while any index (English
-    // or user-lang) is still referencing it.
-    this._itemsCache = new Map(); // listId -> Promise<any[]>
-    this._itemsRefs = new Map();  // listId -> refCount
+    // Raw items cache, keyed per (listId, lang). Reference-counted by the
+    // number of indexes (English + user-lang) currently referencing each key.
+    this._itemsCache = new Map(); // `${listId}:${lang}` -> Promise<any[]>
+    this._itemsRefs = new Map();  // same key -> refCount
 
     this._inFlight = new Map(); // key -> Promise<entry|null>
 
@@ -138,7 +166,7 @@ class IndexManager {
     const origOnEvict = this._userLang.onEvict;
     this._userLang.onEvict = (k, v) => {
       this._stats.userLangEvictions++;
-      this._releaseItems(v.listId);
+      this._releaseItems(v.listId, v.lang);
       origOnEvict(k, v);
     };
   }
@@ -167,27 +195,32 @@ class IndexManager {
     this._stats.searches++;
     if (!Array.isArray(listIds) || listIds.length === 0) return [];
 
-    const tasks = [];
-    for (const listId of listIds) {
-      tasks.push(
-        this._getEnglish(listId).then((entry) => ({
-          hits: entry.instance.search(query, maxResults),
-          lang: 'en',
-        })),
-      );
-      if (userLang && userLang !== 'en') {
-        tasks.push(
-          this._getUserLang(listId, userLang).then((entry) =>
-            entry
-              ? { hits: entry.instance.search(query, maxResults), lang: userLang }
-              : null,
-          ),
-        );
-      }
+    const useUser = userLang && userLang !== 'en';
+    const enPromises = listIds.map((id) => this._getEnglish(id));
+    const userPromises = useUser
+      ? listIds.map((id) => this._getUserLang(id, userLang))
+      : [];
+
+    const [enEntries, userEntries] = await Promise.all([
+      Promise.all(enPromises),
+      Promise.all(userPromises),
+    ]);
+
+    const parts = [];
+    for (const e of enEntries) {
+      parts.push({ hits: e.instance.search(query, maxResults), lang: 'en' });
+    }
+    // `userLangSideMaps` is consulted by `preferUserLang` to look up the
+    // localized doc for items that only matched in the English index but
+    // have a user-language version available.
+    const userLangSideMaps = [];
+    for (const e of userEntries) {
+      if (!e) continue;
+      parts.push({ hits: e.instance.search(query, maxResults), lang: userLang });
+      userLangSideMaps.push(e.idToDoc);
     }
 
-    const parts = (await Promise.all(tasks)).filter(Boolean);
-    return this._merge(parts, maxResults);
+    return this._merge(parts, userLangSideMaps, userLang, maxResults);
   }
 
   /** Free all indexes and clear caches. Idempotent. */
@@ -201,20 +234,68 @@ class IndexManager {
 
   // ---- internals ----------------------------------------------------------
 
-  _merge(parts, n) {
-    const best = new Map();
+  _merge(parts, userLangSideMaps, userLang, n) {
+    // Aggregate hits per item id: collect the doc variant seen in each
+    // matching language, plus per-language scores so we can apply the
+    // `scoreCombine` and `preferDoc` policies at output time.
+    const agg = new Map();
     for (const { hits, lang } of parts) {
       for (const hit of hits) {
         const id = hit.doc && hit.doc.id != null ? hit.doc.id : hit.doc;
-        const cur = best.get(id);
-        if (!cur || hit.score > cur.score) {
-          best.set(id, { doc: hit.doc, score: hit.score, matchedLang: lang });
+        let e = agg.get(id);
+        if (!e) {
+          e = {
+            scoreMax: hit.score,
+            scoreSum: hit.score,
+            bestLang: lang,
+            docsByLang: new Map([[lang, hit.doc]]),
+          };
+          agg.set(id, e);
+        } else {
+          e.scoreSum += hit.score;
+          if (hit.score > e.scoreMax) {
+            e.scoreMax = hit.score;
+            e.bestLang = lang;
+          }
+          e.docsByLang.set(lang, hit.doc);
         }
       }
     }
-    return [...best.values()]
-      .sort((a, b) => b.score - a.score)
-      .slice(0, n);
+
+    const preferUser =
+      this.preferDoc === 'preferUserLang' && userLang && userLang !== 'en';
+
+    const results = [];
+    for (const [id, e] of agg) {
+      const score = this.scoreCombine === 'sum' ? e.scoreSum : e.scoreMax;
+
+      let doc;
+      if (preferUser) {
+        // 1. Prefer the user-language hit when the query matched it directly.
+        if (e.docsByLang.has(userLang)) {
+          doc = e.docsByLang.get(userLang);
+        } else {
+          // 2. Else look up the user-language variant in any loaded user-lang
+          //    side-map (the query didn't match it, but the translation exists).
+          let fromSide;
+          for (const sm of userLangSideMaps) {
+            if (sm && sm.has(id)) {
+              fromSide = sm.get(id);
+              break;
+            }
+          }
+          // 3. Fall back to the doc from whichever language did match.
+          doc = fromSide ?? e.docsByLang.get(e.bestLang);
+        }
+      } else {
+        doc = e.docsByLang.get(e.bestLang);
+      }
+
+      results.push({ doc, score, matchedLang: e.bestLang });
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    return results.slice(0, n);
   }
 
   async _getEnglish(listId) {
@@ -224,8 +305,13 @@ class IndexManager {
       return cached;
     }
     return this._buildCoalesced(`en:${listId}`, async () => {
-      const items = await this._acquireItems(listId);
-      const entry = this._build(items, 'en', listId);
+      const items = await this._acquireItems(listId, 'en');
+      // Filter to items that actually have an English title.
+      const filtered = items.filter((it) => {
+        const t = this.titleFor(it, 'en');
+        return typeof t === 'string' && t.length > 0;
+      });
+      const entry = this._build(filtered, 'en', listId);
       this._english.set(listId, entry);
       this._stats.englishBuilds++;
       return entry;
@@ -241,7 +327,7 @@ class IndexManager {
     }
     return this._buildCoalesced(key, async () => {
       this._stats.userLangMisses++;
-      const items = await this._acquireItems(listId);
+      const items = await this._acquireItems(listId, lang);
       // Only items that actually have a title in `lang` are indexed.
       const filtered = items.filter((it) => {
         const t = this.titleFor(it, lang);
@@ -249,7 +335,7 @@ class IndexManager {
       });
       if (filtered.length === 0) {
         // Don't bother building — but we also don't hold items.
-        this._releaseItems(listId);
+        this._releaseItems(listId, lang);
         return null;
       }
       const entry = this._build(filtered, lang, listId);
@@ -271,32 +357,47 @@ class IndexManager {
     if (bo.maxPrefixBoost != null) builder.maxPrefixBoost(bo.maxPrefixBoost);
     if (bo.scoreThreshold != null) builder.scoreThreshold(bo.scoreThreshold);
     const instance = builder.build();
-    return {
+
+    const entry = {
       instance,
       bytes: this.estimateBytes(items, lang),
       lang,
       listId,
       itemCount: items.length,
     };
+    // For non-English indexes, keep an id → doc side-map so `preferUserLang`
+    // can return the localized doc even for items whose query match only
+    // fired on the English index.
+    if (lang !== 'en') {
+      const idToDoc = new Map();
+      for (const item of items) {
+        const id = item && item.id != null ? item.id : item;
+        idToDoc.set(id, item);
+      }
+      entry.idToDoc = idToDoc;
+    }
+    return entry;
   }
 
-  async _acquireItems(listId) {
-    this._itemsRefs.set(listId, (this._itemsRefs.get(listId) ?? 0) + 1);
-    let p = this._itemsCache.get(listId);
+  async _acquireItems(listId, lang) {
+    const key = `${listId}:${lang}`;
+    this._itemsRefs.set(key, (this._itemsRefs.get(key) ?? 0) + 1);
+    let p = this._itemsCache.get(key);
     if (!p) {
-      p = Promise.resolve().then(() => this.loadList(listId));
-      this._itemsCache.set(listId, p);
+      p = Promise.resolve().then(() => this.loadList(listId, lang));
+      this._itemsCache.set(key, p);
     }
     return p;
   }
 
-  _releaseItems(listId) {
-    const n = (this._itemsRefs.get(listId) ?? 0) - 1;
+  _releaseItems(listId, lang) {
+    const key = `${listId}:${lang}`;
+    const n = (this._itemsRefs.get(key) ?? 0) - 1;
     if (n <= 0) {
-      this._itemsRefs.delete(listId);
-      this._itemsCache.delete(listId);
+      this._itemsRefs.delete(key);
+      this._itemsCache.delete(key);
     } else {
-      this._itemsRefs.set(listId, n);
+      this._itemsRefs.set(key, n);
     }
   }
 

@@ -84,33 +84,59 @@ suited for Node servers that search across many lists in multiple languages:
   build; the second caller doesn't trigger a duplicate rebuild.
 - **Build concurrency limit** — caps the number of simultaneous cold builds so
   event-loop stalls stay bounded (default 2).
-- **Automatic merge** across (list × language) results, deduplicated by item id
-  with the best-scoring language winning.
+- **Automatic merge** across (list × language) results, deduplicated by item id.
+- **Localized display** via `preferDoc: 'preferUserLang'` — returns the
+  user-language doc object in results whenever one exists for that item,
+  even if the query only matched the English index.
+- **Score combination policy** (`'max'` default, `'sum'` optional) when the
+  same item id matches in multiple language indexes.
 
 ```js
 const { IndexManager } = require('./nodejs/manager.js');
 
 const manager = new IndexManager({
-  loadList: async (listId) => fetchListItemsFromDB(listId),
-  titleFor: (item, lang) => item.titles[lang],            // or `item.titleEn` / `item.titleByLang[lang]`
+  // Called per (listId, lang) combination that becomes hot. Return items for
+  // that language; with per-language source lists each item's .name is already
+  // localized. For unified items (all language titles on one object), ignore
+  // `lang` and return the same array — `titleFor` does the per-language pick.
+  loadList: async (listId, lang) => fetchListItemsFromDB(listId, lang),
+  titleFor: (item, lang) => item.name,                    // model (b): item is already in `lang`
   boostComputer: (item) => Math.exp(item.rating / 10),    // optional
   userLangBudgetBytes: 500 * 1024 * 1024,                 // LRU budget (default 500 MB)
   maxConcurrentBuilds: 2,                                 // default 2
   builderOptions: { maxEditDistance: 1, scoreThreshold: 0.48 },
+  preferDoc: 'preferUserLang',                            // display in user's language
+  scoreCombine: 'max',                                    // default
 });
 
 // Warm the English indexes at server start.
-await manager.prewarmEnglish(['movies-top', 'movies-90s', 'series-top', /* ... */]);
+await manager.prewarmEnglish(['movies_age_10', 'series_age_10', /* ... */]);
 
 // Per-request query: 2 lists × 2 languages = 4 searches, merged by item id.
 const results = await manager.search({
   query: 'matrix',
-  listIds: ['movies-top', 'series-top'],
+  listIds: ['movies_age_10', 'series_age_10'],
   userLang: 'fr',
   maxResults: 15,
 });
 // => [{ doc, score, matchedLang: 'en' | 'fr' }, ...]
+// With preferDoc='preferUserLang', doc.name is the French title whenever
+// the item has a French version, regardless of which index matched the query.
 ```
+
+##### `preferDoc` and `scoreCombine` options
+
+When the same `doc.id` matches in both the English and user-language indexes
+(or when the item has a translation that didn't happen to match the query),
+the manager's merge policy decides what to return:
+
+| Option | Values | Default | Purpose |
+|---|---|---|---|
+| `preferDoc` | `'scoreMax'`, `'preferUserLang'` | `'scoreMax'` | Which `doc` object to return per item. `'scoreMax'` returns the variant that scored highest; `'preferUserLang'` returns the user-language doc whenever one exists for that item (falling back to English only when no translation is available). |
+| `scoreCombine` | `'max'`, `'sum'` | `'max'` | How to combine scores when an item matched in multiple language indexes. `'max'` keeps the best single-language score; `'sum'` adds across languages, rewarding items whose translations all match the query. |
+
+For a Stremio-style app (localized titles rendered from `doc.name`, ids unique
+per title), use `preferDoc: 'preferUserLang'` with the default `scoreCombine: 'max'`.
 
 Run the IndexManager tests (includes LRU unit tests + a 20 k-docs-across-10-lists
 benchmark): `node nodejs/manager.test.js`.
